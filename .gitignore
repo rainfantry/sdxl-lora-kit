@@ -1,0 +1,58 @@
+# Personal seed library — tied to a specific subject, never publish
+money_seeds.txt
+money_seeds*.txt
+
+# System prompt files that drifted into this folder from mrrobot work — do not publish
+system_prompt*.txt
+
+# NSFW workflow variants — privacy + decency
+*_nsfw.json
+*_nsfw*
+
+# Generated images and intermediate outputs
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# Random workflow snapshots saved from ComfyUI UI
+PROMPT_*.json
+*_00*.json
+
+# Backup files
+*.bak
+*.bak_*
+*.backup.txt
+*.backup
+*.orig
+*~
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc
+
+# IDE workspaces
+.vscode/
+.idea/
+
+# Local-only scrubber (kept on disk, not part of the public kit)
+_scrub.py
+
+# Environment + secrets
+.env
+.env.local
+*.key
+
+# Dataset folders (per-operator content)
+lora_dataset_raw/
+lora_dataset_ready/
+dataset.zip
+
+# Local working notes
+NOTES.md
+TODO.md
+SCRATCH*

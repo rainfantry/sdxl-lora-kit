@@ -1,0 +1,72 @@
+# SDXL LoRA on RunPod — One-Paste Block
+#
+# WORKFLOW:
+#   1. Spin up RunPod 3090/A40 (community cloud, $0.22-$0.39/hr)
+#   2. Upload your dataset.zip to Google Drive, set sharing to "Anyone with link"
+#   3. Grab the file ID from the share URL (between /d/ and /view)
+#      Example URL: https://drive.google.com/file/d/1Vrb7Ua1Ep988IwudtptwC0G2WghokHa4/view?usp=sharing
+#      File ID:                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#   4. Connect to pod via web terminal
+#   5. Paste the block below (edit GDRIVE_ID + TOKEN at top)
+#   6. Walk away ~55 min
+#   7. Download /workspace/output/<TOKEN>_lora_v1.safetensors
+#   8. Kill pod
+#
+# COST: ~$0.25-0.30 per run on 3090 community
+# TIME: ~5 min setup + ~50 min training = ~55 min total
+#
+# ============================================================
+# PASTE THIS BLOCK (edit top two lines per run)
+# ============================================================
+
+# === EDIT THIS LINE ONLY ===
+GDRIVE_ID="REPLACE_WITH_YOUR_FILE_ID"
+TOKEN="g30rg3wu"
+# ===========================
+NUM_REPEATS=20; EPOCHS=10; RANK=32; ALPHA=16
+
+apt-get update -qq && apt-get install -y -qq unzip git wget aria2 && \
+pip install -q gdown bitsandbytes && \
+if [ ! -d /workspace/kohya_ss ]; then cd /workspace && git clone https://github.com/bmaltais/kohya_ss.git && cd kohya_ss && git submodule update --init --recursive; fi && \
+mkdir -p /workspace/models /workspace/output && \
+if [ ! -f /workspace/models/sd_xl_base_1.0.safetensors ]; then aria2c -x 16 -s 16 --console-log-level=warn -d /workspace/models -o sd_xl_base_1.0.safetensors "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"; fi && \
+cd /workspace && gdown "$GDRIVE_ID" -O dataset.zip && \
+rm -rf /workspace/training_data && mkdir -p "/workspace/training_data/${NUM_REPEATS}_${TOKEN}" && \
+unzip -q -j dataset.zip -d "/workspace/training_data/${NUM_REPEATS}_${TOKEN}/" && \
+cd /workspace/kohya_ss/sd-scripts && \
+python sdxl_train_network.py \
+  --pretrained_model_name_or_path="/workspace/models/sd_xl_base_1.0.safetensors" \
+  --train_data_dir="/workspace/training_data" \
+  --output_dir="/workspace/output" \
+  --output_name="${TOKEN}_lora_v1" \
+  --save_model_as="safetensors" \
+  --caption_extension=".txt" \
+  --resolution=1024 \
+  --train_batch_size=1 \
+  --max_train_epochs=${EPOCHS} \
+  --learning_rate=1e-4 \
+  --unet_lr=1e-4 \
+  --lr_scheduler="cosine" \
+  --optimizer_type="AdamW8bit" \
+  --network_module=networks.lora \
+  --network_dim=${RANK} \
+  --network_alpha=${ALPHA} \
+  --network_train_unet_only \
+  --mixed_precision="bf16" \
+  --no_half_vae \
+  --max_grad_norm=1.0 \
+  --cache_latents \
+  --cache_text_encoder_outputs \
+  --gradient_checkpointing \
+  --sdpa \
+  --save_every_n_epochs=2 \
+  --seed=42
+
+# ============================================================
+# AFTER TRAINING — DOWNLOAD + CLEANUP
+# ============================================================
+# ls -lh /workspace/output/
+# (Use RunPod web file browser to download .safetensors files)
+# (Or scp from laptop):
+#   scp -P <runpod_port> root@<runpod_ip>:/workspace/output/*.safetensors C:\Users\<USER>\comfy\models\loras\
+# Then: STOP THE POD in RunPod console — storage charges accumulate otherwise

@@ -1,0 +1,197 @@
+################################################################################
+#                                                                              #
+#         SDXL LORA INFERENCE ON RUNPOD — COMPLETE PASTE BLOCK                 #
+#                                                                              #
+#  Use AFTER training is done. Generates test images to A/B test LoRAs         #
+#  across different SDXL fine-tune checkpoints with consistent identity.       #
+#                                                                              #
+#  Edit the CONFIG block at top, paste the rest, walk away ~3 min.             #
+#                                                                              #
+################################################################################
+
+
+################################################################################
+# PART A — DEPENDENCY INSTALL + CHECKPOINT DOWNLOADS
+################################################################################
+
+# Install Python deps for diffusers inference (idempotent — fast if present)
+pip install -q diffusers accelerate safetensors peft
+
+# Install aria2 for fast parallel downloads (if not present)
+apt-get install -y -qq aria2
+
+# Download SDXL fine-tune checkpoints into /workspace/models (skip if present).
+# Skipped DreamShaperXL Turbo here — known to hit disk quota on small volumes.
+mkdir -p /workspace/models
+declare -A MODELS=(
+  ["RealVisXL_V5.0_fp16.safetensors"]="https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors"
+  ["Juggernaut-XL_v9.safetensors"]="https://huggingface.co/RunDiffusion/Juggernaut-XL-v9/resolve/main/Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
+)
+
+for name in "${!MODELS[@]}"; do
+  if [ ! -f "/workspace/models/$name" ]; then
+    echo "Downloading $name..."
+    aria2c -x 16 -s 16 --console-log-level=warn -d /workspace/models -o "$name" "${MODELS[$name]}"
+  else
+    echo "$name already present, skipping."
+  fi
+done
+
+echo ""
+echo "=== Checkpoints available: ==="
+ls -lh /workspace/models/*.safetensors
+
+
+################################################################################
+# PART B — INFERENCE LOOP
+################################################################################
+# Edit LORAS, CHECKPOINTS, PROMPTS arrays below to change what's tested.
+# Each combination = one generated PNG.
+# Defaults: 1 LoRA × 3 checkpoints × 3 prompts = 9 PNGs, ~3 min total.
+
+python3 << 'EOF'
+from diffusers import StableDiffusionXLPipeline
+import torch, gc
+
+# ====================== CONFIG (edit these) ======================
+LORAS = [
+    ("e10", "/workspace/output/sks_woman_lora_v3.safetensors"),
+    # ("e08", "/workspace/output/sks_woman_lora_v3-000008.safetensors"),  # uncomment to also test epoch 08
+]
+
+CHECKPOINTS = [
+    ("base",    "/workspace/models/sd_xl_base_1.0.safetensors"),
+    ("realvis", "/workspace/models/RealVisXL_V5.0_fp16.safetensors"),
+    ("juggern", "/workspace/models/Juggernaut-XL_v9.safetensors"),
+]
+
+PROMPTS = [
+    ("close",  "sks_woman, woman, close-up portrait, soft natural light"),
+    ("cinema", "sks_woman, woman, cinematic portrait, golden hour, dramatic lighting"),
+    ("studio", "sks_woman, woman, professional headshot, plain neutral background"),
+]
+
+NEG = (
+    "blurry, deformed, ugly, bad anatomy, low quality, plastic skin, "
+    "double face, watermark, text, signature, cartoon, anime, 3d render"
+)
+
+SEED   = 42       # fixed seed for reproducible A/B comparisons
+SCALE  = 0.8      # LoRA strength (0.7-0.9 sweet spot for faces)
+STEPS  = 25       # denoising steps (25 standard, 35 for max detail)
+CFG    = 7.5      # guidance scale (7.5 default, lower=more natural skin)
+WIDTH  = 1024     # 1024x1024 square, or 832x1216 portrait, or 1216x832 landscape
+HEIGHT = 1024
+# =================================================================
+
+for ckpt_name, ckpt_path in CHECKPOINTS:
+    print(f"\n=== Loading checkpoint: {ckpt_name} ===")
+    pipe = StableDiffusionXLPipeline.from_single_file(
+        ckpt_path, torch_dtype=torch.float16,
+    ).to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+
+    for lora_name, lora_path in LORAS:
+        pipe.load_lora_weights(lora_path, adapter_name=lora_name)
+        pipe.set_adapters([lora_name], adapter_weights=[SCALE])
+
+        for prompt_name, prompt_text in PROMPTS:
+            tag = f"{ckpt_name}_{lora_name}_{prompt_name}" if len(LORAS) > 1 else f"{ckpt_name}_{prompt_name}"
+            print(f"  [gen] {tag} ...", end=" ", flush=True)
+            img = pipe(
+                prompt_text, negative_prompt=NEG,
+                num_inference_steps=STEPS, guidance_scale=CFG,
+                width=WIDTH, height=HEIGHT,
+                generator=torch.Generator("cuda").manual_seed(SEED),
+            ).images[0]
+            out = f"/workspace/output/test_{tag}.png"
+            img.save(out)
+            print(f"-> {out}")
+
+        pipe.delete_adapters([lora_name])
+
+    del pipe; gc.collect(); torch.cuda.empty_cache()
+
+print(f"\nDone. PNGs in /workspace/output/test_*.png")
+print(f"Total: {len(LORAS) * len(CHECKPOINTS) * len(PROMPTS)} images.")
+EOF
+
+
+################################################################################
+# PART C — DOWNLOAD WHEN DONE
+################################################################################
+# Tar everything up for single-file download:
+#
+#   cd /workspace/output && tar -cvf test_outputs.tar test_*.png
+#
+# Then download test_outputs.tar via JupyterLab right-click.
+# Plus download the winning LoRA(s):
+#
+#   sks_woman_lora_v3.safetensors           ← epoch 10 (final)
+#   sks_woman_lora_v3-000008.safetensors    ← epoch 8 (alternate)
+#
+# Drop the LoRAs into your local ComfyUI:
+#   C:\Users\<USER>\Desktop\ui\models\loras\
+#
+# Then KILL THE POD (Stop -> Terminate in RunPod console).
+
+
+################################################################################
+# PART D — TROUBLESHOOTING (uncomment if needed)
+################################################################################
+
+# --- CUDA OOM (out of memory) — zombie process holding VRAM ---
+# Symptom: "torch.OutOfMemoryError" or "Process XXXX has N GiB memory in use"
+# Fix:
+#
+#   nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+#   pkill -9 -f sdxl_train_network                                 # kill training zombie
+#   tmux kill-session -t train                                     # kill tmux session
+#   pkill -9 python                                                # nuclear: kill all python
+#   nvidia-smi                                                     # verify VRAM freed
+
+
+# --- Disk quota exceeded during checkpoint download ---
+# Symptom: "Failed to write into the file ... cause: Quota exceeded"
+# Fix:
+#
+#   du -sh /workspace/* | sort -h                                  # see what's eating space
+#   rm /workspace/models/<broken_partial>.safetensors              # nuke partial downloads
+#   rm /workspace/models/<broken_partial>.safetensors.aria2        # nuke aria2 metadata too
+#   rm /workspace/output/sks_woman_lora_v2-000002.safetensors      # nuke any dead-run leftovers
+
+
+# --- Connection dropped during long inference ---
+# Symptom: SSH dies mid-script, generation stops
+# Fix: wrap script in tmux next time
+#
+#   apt-get install -y tmux
+#   tmux new-session -d -s gen 'bash /tmp/runme.sh'                # detached, survives disconnect
+#   tmux attach -t gen                                             # to watch live
+#   # Ctrl+B then D to detach without killing
+
+
+# --- Slow first generation (JIT compilation, not a hang) ---
+# Symptom: "Loading pipeline components: 100%" then 60+ sec with no output
+# Cause: PyTorch is JIT-compiling CUDA kernels on first forward pass
+# Diagnosis: run nvidia-smi in another terminal — if GPU is at 95-100% util, it's working
+# Fix: wait 30-90 sec for first image; subsequent images are 5-10 sec each
+
+
+# --- "PEFT backend is required for this method" ---
+# Symptom: ValueError when calling set_adapters/load_lora_weights with adapter_name
+# Fix:
+#
+#   pip install peft
+
+
+# --- Bot/script can't see GPU at all ---
+# Symptom: "CUDA not available" or "torch.cuda.is_available() returns False"
+# Cause: PyTorch/CUDA version mismatch with driver, OR running in wrong env
+# Fix on pod: pod was provisioned without GPU — re-check pod config OR spin new pod
+# Fix on laptop: update NVIDIA driver to match the CUDA version PyTorch was built with
+
+
+################################################################################
+#                              END OF INFERENCE PASTE BLOCK                    #
+################################################################################

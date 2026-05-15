@@ -1,0 +1,304 @@
+################################################################################
+#                                                                              #
+#         SDXL LoRA TRAINING ON RUNPOD — COMPLETE WORKFLOW                     #
+#                                                                              #
+#  One artifact. Do the manual section once per new dataset, then paste the    #
+#  auto-block on the pod. Tmux-wrapped so connection drops don't kill it.      #
+#                                                                              #
+#  Total time: 30 min manual prep + 55 min training = ~90 min                  #
+#  Total cost: ~$0.25-0.30 per LoRA on RunPod 3090 community ($0.27/hr)        #
+#                                                                              #
+################################################################################
+
+
+################################################################################
+# PART A — MANUAL PREP (do once per dataset, on your laptop)
+################################################################################
+
+# ─── STEP A1: Gather photos ───────────────────────────────────────────────────
+#
+# Target: 20-30 photos in C:\Users\<USER>\Desktop\kohya\lora_dataset_raw\
+#
+# RULES (hard):
+#   - NO sunglasses, hats over forehead, masks
+#   - NO motion blur, out-of-focus
+#   - NO filters / heavy editing (model learns the filter, not the face)
+#   - NO group shots where multiple faces show
+#   - Minimum resolution 1024x1024 native (more is fine, will downscale)
+#
+# REQUIRED MIX (out of 25 photos):
+#   - 8-10  close-ups       (head fills frame, various expressions)
+#   - 8-10  medium shots    (head + shoulders, various angles: front, 3/4, side)
+#   - 4-6   wider shots     (half-body, different outfits)
+#   - mix lighting types: indoor warm, outdoor daylight, side-lit, etc
+#   - mix backgrounds: don't have all photos in the same room
+#   - mix clothing: model learns variable = changes; constant = identity
+#
+# WHY DIVERSITY: model averages across dataset. 20 varied photos > 100 similar.
+
+
+# ─── STEP A2: Crop to 1024x1024 + write captions ──────────────────────────────
+#
+# Crop tool options (web-based, free):
+#   - BIRME: https://www.birme.net/?target_width=1024&target_height=1024
+#     Drag all photos in, set 1024x1024, "Square" aspect, download zip.
+#
+# Caption files: one .txt per photo, SAME filename:
+#   photo_01.jpg  →  photo_01.txt
+#   photo_02.jpg  →  photo_02.txt
+#
+# CAPTION STRUCTURE (in order):
+#   1. Trigger token       (rare word, e.g. sks_woman, sks_man, ohwx_person)
+#   2. Class word          (woman / man — anchors trigger to category)
+#   3. Pose / expression   (looking at camera, slight smile, looking away)
+#   4. Clothing            (black t-shirt, gold necklace, white tank top)
+#   5. Hair STATE (if varies)  (hair down, hair up, braid)
+#   6. Setting             (indoor, outdoor, white background, kitchen)
+#   7. Lighting            (soft window light, harsh daylight, warm indoor)
+#
+# EXAMPLE:
+#   sks_woman, woman, looking at camera, slight smile, white tank top, indoor, soft natural light
+#
+# DO NOT CAPTION (these become "variable" if you tag them, bad for identity):
+#   ✗ Race / ethnicity
+#   ✗ Eye colour, hair colour, age
+#   ✗ Face shape, jaw, cheekbones
+#   ✗ Body type
+#   ✗ Anything PERMANENT — let it bind to the trigger word
+#
+# RULE: only caption what VARIES between photos. Constant = locked to identity.
+
+
+# ─── STEP A3: Zip and upload to Google Drive ──────────────────────────────────
+#
+# Folder structure to zip (flat, no subfolders):
+#   lora_dataset_ready/
+#     photo_01.jpg
+#     photo_01.txt
+#     photo_02.jpg
+#     photo_02.txt
+#     ...
+#
+# Zip command (PowerShell):
+#   Compress-Archive -Path C:\Users\<USER>\Desktop\kohya\lora_dataset_ready\* `
+#                    -DestinationPath C:\Users\<USER>\Desktop\kohya\dataset.zip
+#
+# Upload dataset.zip to Google Drive:
+#   1. drive.google.com → New → File upload → select dataset.zip
+#   2. Right-click → Share → General access: "Anyone with the link"
+#   3. Copy link, e.g.: https://drive.google.com/file/d/1Vrb7Ua1Ep988IwudtptwC0G2WghokHa4/view
+#   4. Extract the file ID — between /d/ and /view :
+#      File ID = 1Vrb7Ua1Ep988IwudtptwC0G2WghokHa4
+#   5. Paste that ID into the GDRIVE_ID variable below.
+
+
+# ─── STEP A4: Spin up RunPod ──────────────────────────────────────────────────
+#
+# Go to https://www.runpod.io/console/pods → Deploy
+#   GPU:        RTX 3090 (24 GB)  — Community Cloud, ~$0.22-0.34/hr
+#               (Or A40 48 GB ~$0.39/hr if you want headroom)
+#   Template:   RunPod Pytorch 2.4 (or any Pytorch 2.x with CUDA 12+)
+#   Storage:    Container 10 GB, Volume 50 GB
+#   Ports:      Default SSH + HTTP
+#
+# Once running, open Connect → Start Web Terminal.
+# Paste PART B into the web terminal. Walk away.
+
+
+################################################################################
+# PART B — AUTOMATED PASTE BLOCK (paste into RunPod web terminal)
+################################################################################
+
+# ============================================================
+# EDIT THESE 2 LINES PER RUN
+# ============================================================
+GDRIVE_ID="1Vrb7Ua1Ep988IwudtptwC0G2WghokHa4"
+TRIGGER="sks_woman"
+# ============================================================
+# Defaults below — only change if you know why
+NUM_REPEATS=20
+EPOCHS=10
+RANK=32
+ALPHA=16
+LEARNING_RATE="1e-4"
+OUTPUT_VERSION="v1"     # bump on retrains: v1 → v2 → v3
+# ============================================================
+
+# Install system deps + tmux (mandatory — protects against connection drops)
+apt-get update -qq && apt-get install -y -qq unzip git wget aria2 tmux && \
+pip install -q gdown bitsandbytes && \
+\
+# Clone Kohya_ss (skip if already present)
+if [ ! -d /workspace/kohya_ss ]; then \
+    cd /workspace && \
+    git clone https://github.com/bmaltais/kohya_ss.git && \
+    cd kohya_ss && \
+    git submodule update --init --recursive; \
+fi && \
+\
+# Download SDXL Base 1.0 (skip if already present, aria2c parallel = fast)
+mkdir -p /workspace/models /workspace/output && \
+if [ ! -f /workspace/models/sd_xl_base_1.0.safetensors ]; then \
+    aria2c -x 16 -s 16 --console-log-level=warn \
+        -d /workspace/models -o sd_xl_base_1.0.safetensors \
+        "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"; \
+fi && \
+\
+# Pull dataset.zip from Google Drive + restructure for Kohya
+cd /workspace && \
+gdown "$GDRIVE_ID" -O dataset.zip && \
+rm -rf /workspace/training_data && \
+mkdir -p "/workspace/training_data/${NUM_REPEATS}_${TRIGGER}" && \
+unzip -q -j dataset.zip -d "/workspace/training_data/${NUM_REPEATS}_${TRIGGER}/" && \
+\
+# Sanity check dataset
+PHOTO_COUNT=$(ls /workspace/training_data/${NUM_REPEATS}_${TRIGGER}/*.jpg 2>/dev/null | wc -l) && \
+CAP_COUNT=$(ls /workspace/training_data/${NUM_REPEATS}_${TRIGGER}/*.txt 2>/dev/null | wc -l) && \
+echo "Dataset: ${PHOTO_COUNT} photos, ${CAP_COUNT} captions" && \
+\
+# Write training script to /tmp (avoids quoting nightmare in tmux)
+cat > /tmp/run_train.sh << EOF
+#!/bin/bash
+cd /workspace/kohya_ss/sd-scripts
+python sdxl_train_network.py \\
+  --pretrained_model_name_or_path="/workspace/models/sd_xl_base_1.0.safetensors" \\
+  --train_data_dir="/workspace/training_data" \\
+  --output_dir="/workspace/output" \\
+  --output_name="${TRIGGER}_lora_${OUTPUT_VERSION}" \\
+  --save_model_as="safetensors" \\
+  --caption_extension=".txt" \\
+  --resolution=1024 \\
+  --train_batch_size=1 \\
+  --max_train_epochs=${EPOCHS} \\
+  --learning_rate=${LEARNING_RATE} \\
+  --unet_lr=${LEARNING_RATE} \\
+  --lr_scheduler="cosine" \\
+  --optimizer_type="AdamW8bit" \\
+  --network_module=networks.lora \\
+  --network_dim=${RANK} \\
+  --network_alpha=${ALPHA} \\
+  --network_train_unet_only \\
+  --mixed_precision="bf16" \\
+  --no_half_vae \\
+  --max_grad_norm=1.0 \\
+  --cache_latents \\
+  --cache_text_encoder_outputs \\
+  --gradient_checkpointing \\
+  --sdpa \\
+  --save_every_n_epochs=2 \\
+  --seed=42
+echo ""
+echo "============================================"
+echo "=== TRAINING DONE ==="
+echo "============================================"
+ls -lh /workspace/output/
+echo ""
+echo "Session stays alive 2 hrs for download. Then kill pod."
+sleep 7200
+EOF
+chmod +x /tmp/run_train.sh && \
+\
+# Kill any zombie training from previous attempts
+pkill -f sdxl_train_network.py 2>/dev/null; sleep 2 && \
+\
+# Launch in detached tmux session
+tmux kill-session -t train 2>/dev/null; sleep 1 && \
+tmux new-session -d -s train '/tmp/run_train.sh' && \
+\
+sleep 3 && tmux ls && \
+echo "" && \
+echo "============================================================" && \
+echo "TRAINING RUNNING IN TMUX. Disconnect-proof." && \
+echo "============================================================" && \
+echo "  Watch live:      tmux attach -t train" && \
+echo "  Detach (alive):  Ctrl+B  then  D" && \
+echo "  List sessions:   tmux ls" && \
+echo "  GPU usage:       nvidia-smi" && \
+echo "  Checkpoints:     ls -lh /workspace/output/" && \
+echo "  Force kill:      tmux kill-session -t train" && \
+echo "============================================================"
+
+
+################################################################################
+# PART C — MONITORING (run these any time you reconnect)
+################################################################################
+
+# Is tmux session still alive?
+#   tmux ls
+#
+# Is python actually using the GPU?
+#   nvidia-smi
+#   (Look for VRAM ~20+ GB used and 95-100% GPU util)
+#
+# What checkpoints have been saved so far?
+#   ls -lh /workspace/output/
+#   (Should see _lora_v1-000002.safetensors, then -000004, -000006, etc)
+#
+# Watch the live training output:
+#   tmux attach -t train
+#   (Look for: avr_loss=0.0X to 0.15 = healthy. nan = broken, kill it.)
+#   (Ctrl+B then D to detach without killing)
+#
+# How much VRAM is being used right now?
+#   nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+
+################################################################################
+# PART D — DOWNLOAD + CLEANUP (when training done)
+################################################################################
+
+# 1. Verify final LoRA exists:
+#   ls -lh /workspace/output/${TRIGGER}_lora_${OUTPUT_VERSION}.safetensors
+#
+# 2. Download all checkpoints to your laptop:
+#    OPTION A — RunPod web file browser (easiest):
+#       Pod page → "Files" tab → /workspace/output/ → right-click → Download
+#       Download ALL .safetensors files (epoch 2/4/6/8/10 versions)
+#       Some intermediate epochs may have better likeness than final.
+#
+#    OPTION B — scp from laptop:
+#       scp -P <runpod_port> root@<runpod_ip>:/workspace/output/*.safetensors `
+#           C:\Users\<USER>\comfy\models\loras\
+#
+# 3. Drop files into local ComfyUI loras folder:
+#       C:\Users\<USER>\comfy\models\loras\
+#
+# 4. KILL THE POD in RunPod console (storage charges accumulate otherwise):
+#       runpod.io → Pods → Stop → Terminate
+#       (NOT just "Stop" — Terminate fully deletes it)
+#
+# 5. Test in local ComfyUI:
+#       Load Checkpoint (SDXL or RealVisXL)
+#       Load LoRA (your .safetensors), weight 0.7-0.9
+#       Prompt: "sks_woman, portrait, cinematic lighting"
+#       (or whatever your TRIGGER variable was set to)
+
+
+################################################################################
+# PART E — TROUBLESHOOTING (paste-block fixes for common errors)
+################################################################################
+
+# avr_loss=nan  → kill, current command already has bf16+no_half_vae+grad_clip
+#                 If still nan: lower LR to 5e-5, retrain
+#
+# CUDA out of memory  → already has --gradient_checkpointing; if still OOM,
+#                       try smaller resolution: --resolution=768
+#                       Or rent bigger GPU (A40 48GB instead of 3090)
+#
+# tmux: command not found  → apt-get install -y tmux (paste-block already does)
+#
+# unzip: command not found → apt-get install -y unzip (paste-block already does)
+#
+# ModuleNotFoundError: bitsandbytes → pip install bitsandbytes (paste-block does)
+#
+# sdxl_train_network.py: No such file → cd into kohya_ss/sd-scripts/ first
+#                                       (paste-block already does)
+#
+# Connection drops, training dies → wasn't using tmux. This paste-block fixes it.
+#
+# Pod won't see GPU → check nvidia-smi; if blank, restart pod or pick a different one
+
+
+################################################################################
+#                              END OF WORKFLOW                                 #
+################################################################################
